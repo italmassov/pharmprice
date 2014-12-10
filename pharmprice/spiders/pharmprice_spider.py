@@ -10,6 +10,7 @@ from scrapy.selector import Selector
 import urlparse
 import re
 import urllib2
+import numpy
 
 class PharmpriceSpider(scrapy.Spider):
     name = "pharmprice"
@@ -20,13 +21,15 @@ class PharmpriceSpider(scrapy.Spider):
     download_delay = 0.3
 
     def parse(self, response):
+        #yield Request("http://www.pharmprice.kz/annotation.php?id=8377", self.parseAnnotation)
+
         # handle links to letters
         crawledLinks = []
         letLinks = response.xpath('//a[contains(@href, "annotations.php?KeyIndex=")]/@href').extract()
 
         #print("total letter links" + str(len(letLinks)))
 
-        for letIndex in range(27, len(letLinks)):
+        for letIndex in range(1, len(letLinks)):
             #cur_link = urlparse.urljoin(response.url, letLinks[letIndex].strip())
             cur_link = letLinks[letIndex].strip()
 
@@ -48,7 +51,6 @@ class PharmpriceSpider(scrapy.Spider):
 
     def parse2(self, response):
         rows = response.xpath('//table[@class="table table-bordered"]/descendant::tr')
-        #print("number of rows" + str(len(rows)))
 
         for rownum in range(1, len(rows)):
             item = PharmpriceItem()
@@ -68,16 +70,31 @@ class PharmpriceSpider(scrapy.Spider):
 
             yield Request(drugLink, self.parseAnnotation, meta={'item':item})
 
+        # when done with this page handle next pages if available
+        nextPageLink  = ''.join(response.xpath('//ul[@class="pagination"]/descendant::li[@class="active"]/following::li[1]/a/@href').extract())
+        nextPageText = ''.join(response.xpath('//ul[@class="pagination"]/descendant::li[@class="active"]/following::li[1]/a/text()').extract())
+
+        if nextPageLink and nextPageText.isdigit():
+            # check for russian letters
+            curLetter = nextPageLink[-1]
+            if ord(curLetter)>=1040:
+                linkDict = ['%C0', '%C1', '%C2', '%C3', '%C4', '%C5', '%C6', '%C7', '%C8', '%C9', '%CA', '%CB',
+                            '%CC', '%CD', '%CE', '%CF', '%D0', '%D1', '%D2', '%D3', '%D4', '%D5', '%D6','%D7',
+                            '%D8', '%D9','%DA', '%DB', '%DC','%DD', '%DE', '%DF']
+                nextPageLink = nextPageLink[:-1] + linkDict[ord(curLetter)-1040]
+
+            nextPageLink = urlparse.urljoin(response.url, nextPageLink.strip())
+            yield Request(nextPageLink, self.parse2)
+
     def parseAnnotation(self, response):
             item = response.meta['item']
 
-            enhResponse = ''.join(response.xpath("//body").extract())
-            #print(enhResponse)
-            responseText = ''.join(response.xpath("//body/text()").extract())
+            responseText = ''.join(response.xpath("//body/descendant::node()/text()").extract())
+            #print(responseText)
 
             keyWords = [u'Адрес организации, принимающей на территории Республики Казахстан претензии потребителей по качеству продукции',
                         u'Владелец регистрационного удостоверения', u'Владелец регистрационногоудостоверения',
-                        u'Владелецрегистрационного удостоверения', u'Владелецрегистрационногоудостоверения'
+                        u'Владелецрегистрационного удостоверения', u'Владелецрегистрационногоудостоверения',
                         u'Лекарственная форма', u'Лекарственнаяформа',
                         u'Лекарственные взаимодействия',u'Лекарственныевзаимодействия',
                         u'Международное непатентованное название', u'Международноенепатентованное название',
@@ -95,70 +112,163 @@ class PharmpriceSpider(scrapy.Spider):
                         u'Формавыпускаиупаковка', u'Формавыпуска иупаковка', u'Формавыпуска и упаковка']
 
             # go through keywords
+            kwPositions = []
+
             for keyWord in keyWords:
-                searchKW =  '<p class="MsoNormal">' + keyWord   #search keyword
-                kwSP = enhResponse.find(searchKW) #keyword start position
+                kwSP = responseText.find(keyWord) #keyword start position
+                if kwSP !=-1:
+                    #print(keyWord + ": " + str(kwSP))
+                    kwPositions.append(kwSP)
 
-                if kwSP ==-1:
-                    searchKW =  '<p class="MsoNormal">\n"' + keyWord  #search keyword
-                    kwSP = enhResponse.find(searchKW) #keyword start position
+            #print(kwPositions)
+            kwArray = numpy.array(kwPositions)
 
-                if kwSP ==-1:
-                    searchKW =  '<p>' + keyWord   #search keyword
-                    kwSP = enhResponse.find(searchKW) #keyword start position
+            # extract drugGenericName
+            curKw = u"Международное непатентованное название"
+            curSP = responseText.find(curKw)
+            if curSP != -1:
+                if len(kwArray[kwArray>curSP])>0:
+                    nextSection = min(kwArray[kwArray>curSP])
+                else:
+                    nextSection = len(responseText)
 
-                #replacing style for appropriate
-                if kwSP != -1:
-                    classSP = enhResponse.find("MsoNormal",kwSP+1)
-                    if classSP != -1:
-                        classEP = classSP + len("MsoNormal")
-                        enhResponse =  enhResponse[:classSP] + "section" + enhResponse[classEP:]
+                drugGenericName = responseText[(curSP + len(curKw)):nextSection]
+                item['drugGenericName'] = re.sub('[\n\t\r]', ' ', drugGenericName.strip())
 
-            #extract keywords
-            enhSelector = Selector(text=enhResponse)
+            # extract drugForm
+            curKw = u"Лекарственная форма"
+            curSP = responseText.find(curKw)
+            if curSP != -1:
+                if len(kwArray[kwArray>curSP])>0:
+                    nextSection = min(kwArray[kwArray>curSP])
+                else:
+                    nextSection = len(responseText)
 
-            # extract word 1
-            folClasses =  enhSelector.xpath("//p[contains(text(),'%s')]/following::p/@class" % u"Международное непатентованное название").extract()
-            if folClasses:
-                folSectPos = str(folClasses.index(u"section")+1)
-                xpathSynt = "//p[contains(text(),'%s')]/following::p[position()<=" + folSectPos + "]/text()"
-                drugGenericName = ''.join(enhSelector.xpath(xpathSynt % u"Международное непатентованное название").extract())
-                item['drugGenericName'] = re.sub('[\n\t\r]', '', drugGenericName.strip())
+                drugForm = responseText[(curSP + len(curKw)):nextSection]
+                item['drugForm'] = re.sub('[\n\t\r]', ' ', drugForm.strip())
 
-            # extract word 2
-            folClasses =  enhSelector.xpath("//p[contains(text(),'%s')]/following::p/@class" % u"Лекарственная форма").extract()
-            if folClasses:
-                folSectPos = str(folClasses.index(u"section")+1)
-                xpathSynt = "//p[contains(text(),'%s')]/following::p[position()<=" + folSectPos + "]/text()"
-                drugForm = ''.join(enhSelector.xpath(xpathSynt % u"Лекарственная форма").extract())
-                item['drugForm'] = re.sub('[\n\t\r]', '', drugForm .strip())
 
+            # extract drugContent
+            curKw = u"Состав"
+            curSP = responseText.find(curKw)
+            if curSP != -1:
+                if len(kwArray[kwArray>curSP])>0:
+                    nextSection = min(kwArray[kwArray>curSP])
+                else:
+                    nextSection = len(responseText)
+
+                drugContent = responseText[(curSP + len(curKw)):nextSection]
+                item['drugContent'] = re.sub('[\n\t\r]', ' ', drugContent.strip())
+
+            # extract drugProperties
+            curKw = u"Фармакодинамика"
+            curSP = responseText.find(curKw)
+            if curSP != -1:
+                if len(kwArray[kwArray>curSP])>0:
+                    nextSection = min(kwArray[kwArray>curSP])
+                else:
+                    nextSection = len(responseText)
+
+                drugProperties = responseText[(curSP + len(curKw)):nextSection]
+                item['drugProperties'] = re.sub('[\n\t\r]', ' ', drugProperties.strip())
+
+            # extract drugIndication
+            curKw = u"Показания к применению"
+            curSP = responseText.find(curKw)
+            if curSP != -1:
+                if len(kwArray[kwArray>curSP])>0:
+                    nextSection = min(kwArray[kwArray>curSP])
+                else:
+                    nextSection = len(responseText)
+
+                drugIndication = responseText[(curSP + len(curKw)):nextSection]
+                item['drugIndication'] = re.sub('[\n\t\r]', ' ', drugIndication.strip())
+
+            # extract drugDosage
+            curKw = u"Способ применения и дозы"
+            curSP = responseText.find(curKw)
+            if curSP != -1:
+                if len(kwArray[kwArray>curSP])>0:
+                    nextSection = min(kwArray[kwArray>curSP])
+                else:
+                    nextSection = len(responseText)
+
+                drugDosage = responseText[(curSP + len(curKw)):nextSection]
+                item['drugDosage'] = re.sub('[\n\t\r]', ' ', drugDosage.strip())
+
+            # extract drugSide
+            curKw = u"Побочные действия"
+            curSP = responseText.find(curKw)
+            if curSP != -1:
+                if len(kwArray[kwArray>curSP])>0:
+                    nextSection = min(kwArray[kwArray>curSP])
+                else:
+                    nextSection = len(responseText)
+
+                drugSide = responseText[(curSP + len(curKw)):nextSection]
+                item['drugSide'] = re.sub('[\n\t\r]', ' ', drugSide.strip())
+
+            # extract drugContrIndication
+            curKw = u"Противопоказания"
+            curSP = responseText.find(curKw)
+            if curSP != -1:
+                if len(kwArray[kwArray>curSP])>0:
+                    nextSection = min(kwArray[kwArray>curSP])
+                else:
+                    nextSection = len(responseText)
+
+                drugContrIndication = responseText[(curSP + len(curKw)):nextSection]
+                item['drugContrIndication'] = re.sub('[\n\t\r]', ' ', drugContrIndication.strip())
+
+            # extract drugInteractions
+            curKw = u"Лекарственные взаимодействия"
+            curSP = responseText.find(curKw)
+            if curSP != -1:
+                if len(kwArray[kwArray>curSP])>0:
+                    nextSection = min(kwArray[kwArray>curSP])
+                else:
+                    nextSection = len(responseText)
+
+                drugInteractions = responseText[(curSP + len(curKw)):nextSection]
+                item['drugInteractions'] = re.sub('[\n\t\r]', ' ', drugInteractions.strip())
+
+            # extract drugSpecial
+            curKw = u"Особые указания"
+            curSP = responseText.find(curKw)
+            if curSP != -1:
+                if len(kwArray[kwArray>curSP])>0:
+                    nextSection = min(kwArray[kwArray>curSP])
+                else:
+                    nextSection = len(responseText)
+
+                drugSpecial = responseText[(curSP + len(curKw)):nextSection]
+                item['drugSpecial'] = re.sub('[\n\t\r]', ' ', drugSpecial.strip())
+
+            # extract drugExpiry
+            curKw = u"Срок хранения"
+            curSP = responseText.find(curKw)
+            if curSP != -1:
+                if len(kwArray[kwArray>curSP])>0:
+                    nextSection = min(kwArray[kwArray>curSP])
+                else:
+                    nextSection = len(responseText)
+
+                drugExpiry = responseText[(curSP + len(curKw)):nextSection]
+                item['drugExpiry'] = re.sub('[\n\t\r]', ' ', drugExpiry.strip())
+
+            # extract drugRetailCondition
+            curKw = u"Условия отпуска из аптек"
+            curSP = responseText.find(curKw)
+            if curSP != -1:
+                if len(kwArray[kwArray>curSP])>0:
+                    nextSection = min(kwArray[kwArray>curSP])
+                else:
+                    nextSection = len(responseText)
+
+                drugRetailCondition = responseText[(curSP + len(curKw)):nextSection]
+                item['drugRetailCondition'] = re.sub('[\n\t\r]', ' ', drugRetailCondition.strip())
 
             """
-            drugForm = ''.join(response.xpath("//p[contains(text(),'%s')]/following::p[1]/text()" % u"Лекарственная форма").extract())
-            drugContent = ''.join(response.xpath("//p[contains(text(),'%s')]/following::p[1]/text()" % u"Cостав").extract())
-            drugProperties = ''.join(response.xpath("//p[contains(text(),'%s')]/following::p[1]/text()" % u"Фармакодинамика").extract())
-            drugIndication = ''.join(response.xpath("//p[contains(text(),'%s')]/following::p[1]/text()" % u"Показания к применению").extract())
-            drugDosage = ''.join(response.xpath("//p[contains(text(),'%s')]/following::p[1]/text()" % u"Способ применения и дозы").extract())
-            drugSide = ''.join(response.xpath("//p[contains(text(),'%s')]/following::p[1]/text()" % u"Побочные действия").extract())
-            drugContrIndication = ''.join(response.xpath("//p[contains(text(),'%s')]/following::p[1]/text()" % u"Противопоказания").extract())
-            drugInteractions = ''.join(response.xpath("//p[contains(text(),'%s')]/following::p[1]/text()" % u"Лекарственные взаимодействия").extract())
-            drugSpecial = ''.join(response.xpath("//p[contains(text(),'%s')]/following::p[1]/text()" % u"Особые указания").extract())
-            drugExpiry = ''.join(response.xpath("//p[contains(text(),'%s')]/following::p[1]/text()" % u"Срок хранения").extract())
-            drugRetailCondition = ''.join(response.xpath("//p[contains(text(),'%s')]/following::p[1]/text()" % u"Условия отпуска из аптек").extract())
-
-            item['drugForm'] = re.sub('[\n\t\r]', '',drugForm.strip())
-            item['drugContent'] = re.sub('[\n\t\r]', '',drugContent.strip())
-            item['drugProperties'] = re.sub('[\n\t\r]', '',drugProperties.strip())
-            item['drugIndication'] = re.sub('[\n\t\r]', '',drugIndication.strip())
-            item['drugDosage'] = re.sub('[\n\t\r]', '',drugDosage.strip())
-            item['drugSide'] = re.sub('[\n\t\r]', '',drugSide.strip())
-            item['drugContrIndication'] = re.sub('[\n\t\r]', '',drugContrIndication.strip())
-            item['drugInteractions'] = re.sub('[\n\t\r]', '',drugInteractions.strip())
-            item['drugSpecial'] = re.sub('[\n\t\r]', '',drugSpecial.strip())
-            item['drugExpiry'] = re.sub('[\n\t\r]', '',drugExpiry.strip())
-            item['drugRetailCondition'] = re.sub('[\n\t\r]', '',drugRetailCondition.strip())
-
             - Название
             - Синонимы (для подбора схожих лекарств)
             - лекарственная форма
